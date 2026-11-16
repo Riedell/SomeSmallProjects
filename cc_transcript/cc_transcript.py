@@ -3,9 +3,10 @@
 
 用法示例:
   python cc_transcript.py                         # 列出所有会话摘要
-  python cc_transcript.py <file.jsonl> -f md      # 导出为 Markdown 对话
-  python cc_transcript.py <dir> -f jsonl -o out.jsonl --tools --thinking
-  python cc_transcript.py <file.jsonl> -f md --subagents   # 附带子代理对话
+  python cc_transcript.py <file.jsonl> -f md      # 导出为 Markdown 问答（每轮只保留最终回答）
+  python cc_transcript.py <dir> -f jsonl -o out.jsonl          # 每轮问答一行
+  python cc_transcript.py <file.jsonl> -f md --full --tools    # 完整过程，含工具调用
+  python cc_transcript.py <file.jsonl> -f md --subagents       # 附带子代理对话
 
 注意: 该格式是 Claude Code 内部格式，没有官方 schema，字段随版本增减，
 所以这里所有字段访问都用 .get() 容错。
@@ -14,13 +15,17 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 from collections import OrderedDict
 
 DEFAULT_ROOT = os.path.expanduser("~/.claude/projects")
 # 这些 user 文本是 Claude Code 注入的，不是用户真正输入的内容
 INJECTED_PREFIXES = ("<local-command-", "<command-name>", "<command-message>",
-                     "<system-reminder>", "<task-notification>", "Caveat:")
+                     "<system-reminder>", "<task-notification>", "<agent-message",
+                     "Another Claude session sent", "Caveat:")
+INTERRUPT_PREFIX = "[Request interrupted by user"
+HEADING_RE = re.compile(r"^#{1,6}\s")
 
 
 def read_jsonl(path):
@@ -74,7 +79,26 @@ def tool_result_text(content):
     return "\n".join(parts)
 
 
-def build_turns(records, include_meta=False):
+def classify_user(r, text):
+    """区分 user 消息来源: human(用户输入) / interrupt(用户中断) / injected(系统注入)。
+
+    新版本记录带 origin.kind（human / peer / task-notification 等），旧版本没有，
+    只能靠 isMeta 和文本前缀判断。
+    """
+    s = text.lstrip()
+    if r.get("isMeta") or r.get("isCompactSummary"):
+        return "injected"
+    if s.startswith(INTERRUPT_PREFIX):
+        return "interrupt"
+    if s.startswith(INJECTED_PREFIXES):
+        return "injected"
+    origin = r.get("origin")
+    if isinstance(origin, dict) and origin.get("kind"):
+        return "human" if origin["kind"] == "human" else "injected"
+    return "human"
+
+
+def build_turns(records):
     """把原始记录整理成消息列表。
 
     一次 API 回复会被拆成多行 assistant 记录（每个 content block 一行，
@@ -103,8 +127,6 @@ def build_turns(records, include_meta=False):
                 turn["usage"] = msg["usage"]  # 同一 id 的多行 usage 相同/递增，取最后一个
             turn["stop_reason"] = msg.get("stop_reason") or turn.get("stop_reason")
         elif t == "user":
-            if r.get("isMeta") and not include_meta:
-                continue
             content = msg.get("content")
             blocks = [{"type": "text", "text": content}] if isinstance(content, str) else list(content or [])
             results = [b for b in blocks if b.get("type") == "tool_result"]
@@ -119,15 +141,53 @@ def build_turns(records, include_meta=False):
             if others:
                 text = "\n".join(b.get("text", "") if b.get("type") == "text" else f"[{b.get('type')}]"
                                  for b in others)
-                injected = text.lstrip().startswith(INJECTED_PREFIXES)
-                if injected and not include_meta:
-                    continue
                 turns.append({"role": "user", "timestamp": r.get("timestamp"), "text": text,
-                              "injected": injected})
-        elif t == "system" and include_meta:
+                              "kind": classify_user(r, text)})
+        elif t == "system":
             turns.append({"role": "system", "timestamp": r.get("timestamp"),
                           "subtype": r.get("subtype"), "text": r.get("content") or ""})
     return turns
+
+
+def visible_turns(turns, include_meta):
+    """--full 模式下要展示的消息：默认去掉系统注入的 user 消息和 system 记录。"""
+    if include_meta:
+        return turns
+    return [t for t in turns
+            if t["role"] in ("assistant", "tool") or (t["role"] == "user" and t["kind"] != "injected")]
+
+
+def build_rounds(turns):
+    """按用户真实输入切分成轮，每轮只保留最终文本回答。
+
+    一轮里模型会反复「说一句 → 调工具 → 看结果」，夹在工具调用之间的文字都是过程说明；
+    只有模型交还控制权前、最后一个 tool_use 之后的文字才是回答。
+    后台任务通知、子代理回报、用户中断等注入消息会在同一轮里再次唤醒模型，
+    它们把一轮切成多段，每段各取自己的最终文字。
+    """
+    rounds = []
+    for t in turns:
+        if t["role"] == "user" and t["kind"] == "human":
+            rounds.append({"timestamp": t["timestamp"], "prompt": t["text"],
+                           "segments": [[]], "interrupted": False})
+            continue
+        if not rounds:
+            continue  # 第一条用户输入之前的注入内容
+        cur = rounds[-1]
+        if t["role"] == "user":
+            if t["kind"] == "interrupt":
+                cur["interrupted"] = True
+            cur["segments"].append([])
+        elif t["role"] == "assistant":
+            seg = cur["segments"][-1]
+            for b in t["blocks"]:
+                if b.get("type") == "tool_use":
+                    seg.clear()
+                elif b.get("type") == "text" and b.get("text", "").strip():
+                    seg.append(b["text"])
+    for r in rounds:
+        r["answer"] = "\n\n".join("\n\n".join(seg) for seg in r.pop("segments") if seg)
+    return rounds
 
 
 def session_info(path, records, turns):
@@ -144,7 +204,7 @@ def session_info(path, records, turns):
             for k in usage:
                 usage[k] += (t.get("usage") or {}).get(k) or 0
     cost = next((r for r in reversed(records) if r.get("type") == "cost-state"), {})
-    first_prompt = next((t["text"] for t in turns if t["role"] == "user" and not t.get("injected")), "")
+    prompts = [t["text"] for t in turns if t["role"] == "user" and t["kind"] == "human"]
     return {
         "file": path,
         "sessionId": first.get("sessionId") or os.path.splitext(os.path.basename(path))[0],
@@ -155,12 +215,12 @@ def session_info(path, records, turns):
         "start": min(stamps) if stamps else None,
         "end": max(stamps) if stamps else None,
         "models": list(models),
-        "user_turns": sum(1 for t in turns if t["role"] == "user" and not t.get("injected")),
+        "user_turns": len(prompts),
         "assistant_turns": sum(1 for t in turns if t["role"] == "assistant"),
         "tool_calls": sum(1 for t in turns if t["role"] == "tool"),
         "usage": usage,
         "totalCostUSD": cost.get("totalCostUSD"),
-        "first_prompt": first_prompt[:200],
+        "first_prompt": prompts[0][:200] if prompts else "",
     }
 
 
@@ -184,12 +244,42 @@ def truncate(s, n):
     return s if n <= 0 or len(s) <= n else s[:n] + f"\n... [截断，共 {len(s)} 字符]"
 
 
-def render_md(info, turns, args, level=1):
+def demote_headings(text, by):
+    """把正文里自带的 Markdown 标题整体降级，避免和外层的角色标题同级。"""
+    out, fence = [], False
+    for line in text.split("\n"):
+        if line.lstrip().startswith(("```", "~~~")):
+            fence = not fence
+        elif not fence and HEADING_RE.match(line):
+            line = "#" * by + line
+        out.append(line)
+    return "\n".join(out)
+
+
+def md_header(info, h):
+    return [f"{h} {info['title'] or info['sessionId']}", "",
+            f"- session: `{info['sessionId']}`  cwd: `{info['cwd']}`  branch: `{info['gitBranch']}`",
+            f"- 时间: {info['start']} ~ {info['end']}  模型: {', '.join(info['models'])}",
+            f"- tokens: {info['usage']}", ""]
+
+
+def render_rounds_md(info, rounds, level=1):
     h = "#" * level
-    lines = [f"{h} {info['title'] or info['sessionId']}", "",
-             f"- session: `{info['sessionId']}`  cwd: `{info['cwd']}`  branch: `{info['gitBranch']}`",
-             f"- 时间: {info['start']} ~ {info['end']}  模型: {', '.join(info['models'])}",
-             f"- tokens: {info['usage']}", ""]
+    lines = md_header(info, h)
+    for i, r in enumerate(rounds, 1):
+        if r["answer"]:
+            answer = demote_headings(r["answer"], level + 1)
+        else:
+            answer = "*（本轮被中断，没有最终回答）*" if r["interrupted"] else "*（没有文本回答）*"
+        lines += [f"{h}# 👤 User {i}  <sub>{r['timestamp']}</sub>", "",
+                  demote_headings(r["prompt"], level + 1), "",
+                  f"{h}# 🤖 Assistant {i}", "", answer, ""]
+    return "\n".join(lines)
+
+
+def render_full_md(info, turns, args, level=1):
+    h = "#" * level
+    lines = md_header(info, h)
     for t in turns:
         role = t["role"]
         if role == "user":
@@ -218,7 +308,7 @@ def render_md(info, turns, args, level=1):
 
 
 def to_jsonable(turn, args):
-    """jsonl 输出：每条消息一行，扁平化，便于再用 pandas 等处理。"""
+    """--full 的 jsonl 输出：每条消息一行，扁平化，便于再用 pandas 等处理。"""
     t = dict(turn)
     if t["role"] == "assistant":
         t["text"] = "\n".join(b.get("text", "") for b in t["blocks"] if b.get("type") == "text")
@@ -232,6 +322,12 @@ def to_jsonable(turn, args):
         t["text"] = truncate(t["text"], args.max_chars)
         t.pop("structured", None)  # 体积大（含完整文件内容/diff），需要时自行读取 toolUseResult
     return t
+
+
+def jsonl_rows(turns, args):
+    if args.full:
+        return [to_jsonable(t, args) for t in visible_turns(turns, args.meta)]
+    return [{"round": i, **r} for i, r in enumerate(build_rounds(turns), 1)]
 
 
 def collect_files(paths):
@@ -251,23 +347,25 @@ def main():
     ap.add_argument("paths", nargs="*", default=[DEFAULT_ROOT], help="jsonl 文件或目录（默认 ~/.claude/projects）")
     ap.add_argument("-f", "--format", choices=["summary", "md", "jsonl"], default="summary")
     ap.add_argument("-o", "--output", help="输出文件（默认 stdout）")
-    ap.add_argument("--tools", action="store_true", help="包含工具调用及结果")
-    ap.add_argument("--thinking", action="store_true", help="包含 thinking 内容")
-    ap.add_argument("--meta", action="store_true", help="包含 isMeta / 斜杠命令 / system 等注入消息")
+    ap.add_argument("--full", action="store_true", help="输出完整过程（每条消息），默认只输出每轮问答的最终回答")
+    ap.add_argument("--tools", action="store_true", help="包含工具调用及结果（隐含 --full）")
+    ap.add_argument("--thinking", action="store_true", help="包含 thinking 内容（隐含 --full）")
+    ap.add_argument("--meta", action="store_true", help="包含 isMeta / 斜杠命令 / system 等注入消息（隐含 --full）")
     ap.add_argument("--all-branches", action="store_true", help="按文件顺序处理全部记录，不只取当前分支")
     ap.add_argument("--subagents", action="store_true", help="同时解析子代理对话")
     ap.add_argument("--max-chars", type=int, default=2000, help="工具输入/结果截断长度，0 为不截断")
     args = ap.parse_args()
+    args.full = args.full or args.tools or args.thinking or args.meta
 
-    out = open(args.output, "w", encoding="utf-8") if args.output else sys.stdout
+    out = open(args.output, "w", encoding="utf-8", newline="\n") if args.output else sys.stdout
     if out is sys.stdout:
         sys.stdout.reconfigure(encoding="utf-8")  # Windows 控制台默认 GBK，会乱码
 
     for path in collect_files(args.paths):
         records = read_jsonl(path)
         chain = records if args.all_branches else main_chain(records)
-        turns = build_turns(chain, include_meta=args.meta)
-        if not turns:
+        turns = build_turns(chain)
+        if not any(t["role"] in ("user", "assistant") for t in turns):
             continue
         info = session_info(path, records, turns)
         subs = subagent_files(path) if args.subagents else []
@@ -275,24 +373,30 @@ def main():
         if args.format == "summary":
             out.write(json.dumps(info, ensure_ascii=False) + "\n")
         elif args.format == "md":
-            out.write(render_md(info, turns, args) + "\n")
+            if args.full:
+                out.write(render_full_md(info, visible_turns(turns, args.meta), args) + "\n")
+            else:
+                out.write(render_rounds_md(info, build_rounds(turns)) + "\n")
             for f, meta in subs:
                 srecs = read_jsonl(f)
-                sturns = build_turns(srecs, include_meta=args.meta)
+                sturns = build_turns(srecs)
                 sinfo = session_info(f, srecs, sturns)
                 sinfo["title"] = f"子代理 [{meta.get('agentType')}] {meta.get('description', '')}"
-                out.write(render_md(sinfo, sturns, args, level=2) + "\n")
+                if args.full:
+                    out.write(render_full_md(sinfo, visible_turns(sturns, args.meta), args, level=2) + "\n")
+                else:
+                    out.write(render_rounds_md(sinfo, build_rounds(sturns), level=2) + "\n")
             out.write("\n---\n\n")
         else:
-            for t in turns:
-                row = {"sessionId": info["sessionId"], "title": info["title"], **to_jsonable(t, args)}
-                out.write(json.dumps(row, ensure_ascii=False) + "\n")
+            for row in jsonl_rows(turns, args):
+                out.write(json.dumps({"sessionId": info["sessionId"], "title": info["title"], **row},
+                                     ensure_ascii=False) + "\n")
             for f, meta in subs:
-                for t in build_turns(read_jsonl(f), include_meta=args.meta):
-                    row = {"sessionId": info["sessionId"], "subagent": os.path.basename(f),
-                           "agentType": meta.get("agentType"), "parentToolUseId": meta.get("toolUseId"),
-                           **to_jsonable(t, args)}
-                    out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                for row in jsonl_rows(build_turns(read_jsonl(f)), args):
+                    out.write(json.dumps({"sessionId": info["sessionId"], "subagent": os.path.basename(f),
+                                          "agentType": meta.get("agentType"),
+                                          "parentToolUseId": meta.get("toolUseId"), **row},
+                                         ensure_ascii=False) + "\n")
     if out is not sys.stdout:
         out.close()
 
